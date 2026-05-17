@@ -1,0 +1,40 @@
+# Fly.io app config for llm-gateway.
+# Deploy from repo root with:
+#   fly deploy --config deploy/fly.toml --dockerfile deploy/Dockerfile
+#
+# Secrets (set once, not in this file):
+#   fly secrets set GATEWAY_API_KEY=...
+#   fly secrets set OPENAI_API_KEY=...
+#   fly secrets set ANTHROPIC_API_KEY=...
+
+app = "llm-gateway"
+primary_region = "bom"  # Mumbai — change to your nearest region
+
+[build]
+
+[env]
+  ADDR = ":8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+  method = "GET"
+  path = "/healthz"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
