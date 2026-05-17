@@ -3,6 +3,7 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -55,6 +56,35 @@ func TestComplete_UpstreamError(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error")
+	}
+	var ue *provider.UpstreamError
+	if !errors.As(err, &ue) {
+		t.Fatalf("expected *UpstreamError, got %T: %v", err, err)
+	}
+	if ue.Status != http.StatusInternalServerError {
+		t.Fatalf("status = %d (want 500)", ue.Status)
+	}
+	if !ue.Retryable() {
+		t.Fatal("500 should be retryable")
+	}
+}
+
+func TestComplete_ClientErrorNotRetryable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "bad", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	a := New("test-key", WithBaseURL(srv.URL))
+	_, err := a.Complete(context.Background(), &provider.Request{
+		Model: "gpt-4o-mini", Messages: []provider.Message{{Role: "user", Content: "x"}},
+	})
+	var ue *provider.UpstreamError
+	if !errors.As(err, &ue) {
+		t.Fatalf("expected *UpstreamError, got %T", err)
+	}
+	if ue.Retryable() {
+		t.Fatal("400 should NOT be retryable")
 	}
 }
 

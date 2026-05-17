@@ -28,6 +28,7 @@ const (
 	defaultBaseURL   = "https://api.anthropic.com"
 	apiVersion       = "2023-06-01"
 	defaultMaxTokens = 4096
+	providerName     = "anthropic"
 )
 
 type Adapter struct {
@@ -53,7 +54,7 @@ func New(apiKey string, opts ...Option) *Adapter {
 	return a
 }
 
-func (a *Adapter) Name() string { return "anthropic" }
+func (a *Adapter) Name() string { return providerName }
 
 type anthMessage struct {
 	Role    string `json:"role"`
@@ -145,18 +146,18 @@ func (a *Adapter) Complete(ctx context.Context, req *provider.Request) (*provide
 
 	resp, err := a.client.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", provider.ErrUpstream, err)
+		return nil, &provider.UpstreamError{Provider: providerName, Err: err}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("%w: status=%d body=%s", provider.ErrUpstream, resp.StatusCode, string(b))
+		return nil, &provider.UpstreamError{Provider: providerName, Status: resp.StatusCode, Body: string(b)}
 	}
 
 	var ar anthResponse
 	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
-		return nil, fmt.Errorf("%w: decode: %v", provider.ErrUpstream, err)
+		return nil, &provider.UpstreamError{Provider: providerName, Err: fmt.Errorf("decode response: %w", err)}
 	}
 
 	var text strings.Builder
@@ -239,13 +240,13 @@ func (a *Adapter) Stream(ctx context.Context, req *provider.Request) (<-chan pro
 
 		resp, err := a.client.Do(httpReq)
 		if err != nil {
-			errs <- fmt.Errorf("%w: %v", provider.ErrUpstream, err)
+			errs <- &provider.UpstreamError{Provider: providerName, Err: err}
 			return
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= 400 {
 			b, _ := io.ReadAll(resp.Body)
-			errs <- fmt.Errorf("%w: status=%d body=%s", provider.ErrUpstream, resp.StatusCode, string(b))
+			errs <- &provider.UpstreamError{Provider: providerName, Status: resp.StatusCode, Body: string(b)}
 			return
 		}
 
@@ -272,7 +273,7 @@ func (a *Adapter) Stream(ctx context.Context, req *provider.Request) (<-chan pro
 
 			var ev anthStreamEvent
 			if err := json.Unmarshal([]byte(payload), &ev); err != nil {
-				errs <- fmt.Errorf("%w: parse event: %v", provider.ErrUpstream, err)
+				errs <- &provider.UpstreamError{Provider: providerName, Err: fmt.Errorf("parse event: %w", err)}
 				return
 			}
 
