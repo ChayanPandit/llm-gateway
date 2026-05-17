@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ChayanPandit/llm-gateway/internal/provider"
+	"github.com/ChayanPandit/llm-gateway/internal/reliability"
 	"github.com/ChayanPandit/llm-gateway/internal/router"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -93,28 +94,84 @@ func chatCompletionsHandler(rt *router.Router, log *slog.Logger) http.HandlerFun
 			return
 		}
 
-		p, upstreamModel, err := rt.Resolve(req.Model)
+		chain, err := rt.Resolve(req.Model)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		// Hand the adapter the unprefixed model name.
-		req.Model = upstreamModel
 
 		ctx := r.Context()
 		if req.Stream {
-			streamResponse(ctx, w, p, &req, log)
+			// Stream uses primary only; no failover for streams (see decorator.go).
+			streamReq := req
+			streamReq.Model = chain.Primary.Model
+			streamResponse(ctx, w, chain.Primary.Provider, &streamReq, log)
 			return
 		}
 
-		resp, err := p.Complete(ctx, &req)
-		if err != nil {
-			handleUpstreamError(w, err)
+		resp, lastErr := tryChain(ctx, chain, &req, log)
+		if lastErr != nil {
+			handleUpstreamError(w, lastErr)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	}
+}
+
+// tryChain attempts the primary target, then walks fallbacks on failover-
+// eligible errors. Returns the last error encountered if every target fails.
+func tryChain(ctx context.Context, chain *router.Chain, baseReq *provider.Request, log *slog.Logger) (*provider.Response, error) {
+	targets := append([]router.Target{chain.Primary}, chain.Fallback...)
+	var lastErr error
+	for i, t := range targets {
+		// Hand the adapter the unprefixed, upstream-native model name.
+		req := *baseReq
+		req.Model = t.Model
+
+		resp, err := t.Provider.Complete(ctx, &req)
+		if err == nil {
+			if i > 0 {
+				log.Info("fallback succeeded",
+					"provider", t.Provider.Name(),
+					"model", t.Model,
+					"request_id", middleware.GetReqID(ctx),
+				)
+			}
+			return resp, nil
+		}
+		lastErr = err
+
+		if !isFailoverEligible(err) || i == len(targets)-1 {
+			return nil, err
+		}
+		log.Warn("primary failed, attempting fallback",
+			"provider", t.Provider.Name(),
+			"err", err.Error(),
+			"request_id", middleware.GetReqID(ctx),
+		)
+	}
+	return nil, lastErr
+}
+
+// isFailoverEligible decides whether a Complete error should trigger a
+// fallback attempt. Eligible:
+//   - ErrCircuitOpen (provider's breaker is rejecting)
+//   - *provider.UpstreamError (5xx, 429, transport — already exhausted retries)
+//
+// NOT eligible:
+//   - ErrUnknownModel, ErrNotConfigured (configuration problems)
+//   - context cancellation
+//   - 4xx client errors
+func isFailoverEligible(err error) bool {
+	if errors.Is(err, reliability.ErrCircuitOpen) {
+		return true
+	}
+	var ue *provider.UpstreamError
+	if errors.As(err, &ue) {
+		return ue.Retryable() || ue.Status == 0
+	}
+	return false
 }
 
 func streamResponse(ctx context.Context, w http.ResponseWriter, p provider.Provider, req *provider.Request, log *slog.Logger) {
