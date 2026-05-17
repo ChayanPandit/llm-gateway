@@ -19,13 +19,18 @@ import (
 )
 
 type Config struct {
-	GatewayAPIKey string
-	Logger        *slog.Logger
+	GatewayAPIKey  string
+	Logger         *slog.Logger
+	RequestTimeout time.Duration       // applied to /v1/* requests
+	Breakers       []*reliability.Breaker // for /ready to inspect
 }
 
 func New(cfg Config, r *router.Router) http.Handler {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.RequestTimeout <= 0 {
+		cfg.RequestTimeout = 120 * time.Second
 	}
 
 	mux := chi.NewRouter()
@@ -38,12 +43,50 @@ func New(cfg Config, r *router.Router) http.Handler {
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	mux.Get("/ready", readinessHandler(cfg.Breakers))
+
 	mux.Group(func(g chi.Router) {
 		g.Use(authMiddleware(cfg.GatewayAPIKey))
+		g.Use(timeoutMiddleware(cfg.RequestTimeout))
 		g.Post("/v1/chat/completions", chatCompletionsHandler(r, cfg.Logger))
 	})
 
 	return mux
+}
+
+// timeoutMiddleware bounds how long any single request can hold a goroutine.
+// The deadline propagates through context.Context into upstream HTTP calls
+// and retry sleeps, so cancellation is honored end-to-end.
+func timeoutMiddleware(d time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), d)
+			defer cancel()
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// readinessHandler returns 200 if at least one provider's breaker is not
+// fully Open. Returns 503 only when every upstream is unreachable, signalling
+// load balancers / orchestrators to pull this instance out of rotation.
+func readinessHandler(breakers []*reliability.Breaker) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		if len(breakers) == 0 {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ready"))
+			return
+		}
+		for _, b := range breakers {
+			if b.State() != reliability.StateOpen {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("ready"))
+				return
+			}
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("no providers ready"))
+	}
 }
 
 func authMiddleware(expected string) func(http.Handler) http.Handler {
@@ -236,10 +279,20 @@ func handleUpstreamError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, provider.ErrNotConfigured):
 		writeError(w, http.StatusServiceUnavailable, err.Error())
+	case errors.Is(err, reliability.ErrCircuitOpen):
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+	case errors.Is(err, context.DeadlineExceeded):
+		writeError(w, http.StatusGatewayTimeout, "request timed out")
 	case errors.Is(err, provider.ErrUnknownModel):
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.As(err, &ue):
-		writeError(w, http.StatusBadGateway, err.Error())
+		// Map 4xx upstream → 502 from gateway? No — pass-through 4xx for
+		// client visibility, treat 5xx as 502 (bad gateway).
+		if ue.Status >= 400 && ue.Status < 500 {
+			writeError(w, ue.Status, err.Error())
+		} else {
+			writeError(w, http.StatusBadGateway, err.Error())
+		}
 	default:
 		writeError(w, http.StatusInternalServerError, err.Error())
 	}
