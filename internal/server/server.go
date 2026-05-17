@@ -175,12 +175,13 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 func handleUpstreamError(w http.ResponseWriter, err error) {
+	var ue *provider.UpstreamError
 	switch {
 	case errors.Is(err, provider.ErrNotConfigured):
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 	case errors.Is(err, provider.ErrUnknownModel):
 		writeError(w, http.StatusBadRequest, err.Error())
-	case errors.Is(err, provider.ErrUpstream):
+	case errors.As(err, &ue):
 		writeError(w, http.StatusBadGateway, err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, err.Error())

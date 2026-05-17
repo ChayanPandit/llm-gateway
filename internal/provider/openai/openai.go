@@ -18,6 +18,8 @@ import (
 	"github.com/ChayanPandit/llm-gateway/internal/provider"
 )
 
+const providerName = "openai"
+
 const defaultBaseURL = "https://api.openai.com"
 
 type Adapter struct {
@@ -43,7 +45,7 @@ func New(apiKey string, opts ...Option) *Adapter {
 	return a
 }
 
-func (a *Adapter) Name() string { return "openai" }
+func (a *Adapter) Name() string { return providerName }
 
 func (a *Adapter) Complete(ctx context.Context, req *provider.Request) (*provider.Response, error) {
 	if a.apiKey == "" {
@@ -62,18 +64,18 @@ func (a *Adapter) Complete(ctx context.Context, req *provider.Request) (*provide
 
 	resp, err := a.client.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", provider.ErrUpstream, err)
+		return nil, &provider.UpstreamError{Provider: providerName, Err: err}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("%w: status=%d body=%s", provider.ErrUpstream, resp.StatusCode, string(b))
+		return nil, &provider.UpstreamError{Provider: providerName, Status: resp.StatusCode, Body: string(b)}
 	}
 
 	var out provider.Response
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("%w: decode: %v", provider.ErrUpstream, err)
+		return nil, &provider.UpstreamError{Provider: providerName, Err: fmt.Errorf("decode response: %w", err)}
 	}
 	return &out, nil
 }
@@ -110,13 +112,13 @@ func (a *Adapter) Stream(ctx context.Context, req *provider.Request) (<-chan pro
 
 		resp, err := a.client.Do(httpReq)
 		if err != nil {
-			errs <- fmt.Errorf("%w: %v", provider.ErrUpstream, err)
+			errs <- &provider.UpstreamError{Provider: providerName, Err: err}
 			return
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= 400 {
 			b, _ := io.ReadAll(resp.Body)
-			errs <- fmt.Errorf("%w: status=%d body=%s", provider.ErrUpstream, resp.StatusCode, string(b))
+			errs <- &provider.UpstreamError{Provider: providerName, Status: resp.StatusCode, Body: string(b)}
 			return
 		}
 
@@ -139,7 +141,7 @@ func (a *Adapter) Stream(ctx context.Context, req *provider.Request) (<-chan pro
 			}
 			var d provider.StreamDelta
 			if err := json.Unmarshal([]byte(payload), &d); err != nil {
-				errs <- fmt.Errorf("%w: parse chunk: %v", provider.ErrUpstream, err)
+				errs <- &provider.UpstreamError{Provider: providerName, Err: fmt.Errorf("parse chunk: %w", err)}
 				return
 			}
 			select {

@@ -5,6 +5,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"fmt"
 )
 
 type Message struct {
@@ -72,7 +73,41 @@ type Provider interface {
 }
 
 var (
-	ErrUpstream      = errors.New("upstream provider error")
 	ErrUnknownModel  = errors.New("unknown model")
 	ErrNotConfigured = errors.New("provider not configured (missing API key)")
 )
+
+// UpstreamError represents a failure talking to an upstream LLM provider —
+// either an HTTP error response or a network/transport error. The reliability
+// layer inspects Status (and Err) to decide whether to retry: 5xx and 429 are
+// retryable, 4xx is not, and transport errors (Status == 0) are retryable.
+type UpstreamError struct {
+	Provider string // adapter name, e.g. "openai"
+	Status   int    // HTTP status from upstream; 0 if the request didn't complete
+	Body     string // raw response body (truncated) for debugging
+	Err      error  // underlying transport error if any (timeout, conn refused, parse, etc.)
+}
+
+func (e *UpstreamError) Error() string {
+	if e.Status == 0 {
+		return fmt.Sprintf("upstream %s: %v", e.Provider, e.Err)
+	}
+	return fmt.Sprintf("upstream %s: status=%d body=%s", e.Provider, e.Status, e.Body)
+}
+
+func (e *UpstreamError) Unwrap() error { return e.Err }
+
+// Retryable reports whether the failure is worth another attempt.
+//   - status == 0 (transport-level): retry (timeout, conn refused, dropped conn)
+//   - 429: retry (rate limited)
+//   - 5xx: retry (server error)
+//   - everything else (4xx): permanent client error, don't retry
+func (e *UpstreamError) Retryable() bool {
+	if e.Status == 0 {
+		return true
+	}
+	if e.Status == 429 {
+		return true
+	}
+	return e.Status >= 500 && e.Status < 600
+}
