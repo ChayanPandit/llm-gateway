@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ChayanPandit/llm-gateway/internal/cache"
+	"github.com/ChayanPandit/llm-gateway/internal/embedder"
 	"github.com/ChayanPandit/llm-gateway/internal/provider"
 	"github.com/ChayanPandit/llm-gateway/internal/provider/anthropic"
 	"github.com/ChayanPandit/llm-gateway/internal/provider/openai"
@@ -73,23 +74,41 @@ func main() {
 	rt := router.New(providers)
 	configureFailover(rt, logger)
 
-	// Cache is optional. If CACHE_ENABLED=true (and REDIS_URL is set), we
-	// connect; otherwise the handler runs without caching. Connect failures
+	// Cache is optional. If CACHE_ENABLED=true and REDIS_URL is set, we
+	// connect and wrap the client in an exact-match cache. Connect failures
 	// don't fatal the gateway — log a warning and proceed cache-less so a
 	// flaky Redis can't prevent a fresh deploy from coming up.
-	var c cache.Cache
+	var (
+		rdb           *redis.Client
+		exactCache    cache.Cache
+		semCache      cache.SemanticCache
+		threshold     float64
+	)
 	cacheTTL := getEnvDuration("CACHE_TTL", 24*time.Hour)
+
 	if isTruthy(os.Getenv("CACHE_ENABLED")) {
-		c = buildRedisCache(logger)
+		rdb = buildRedisClient(logger)
+		if rdb != nil {
+			exactCache = cache.NewRedisCache(rdb, os.Getenv("CACHE_NAMESPACE"))
+		}
+	}
+
+	// Semantic cache is opt-in on top of exact cache: requires
+	// SEMANTIC_CACHE_ENABLED, a working Redis Stack connection, AND an
+	// OpenAI key for embeddings (regardless of which chat provider you use).
+	if isTruthy(os.Getenv("SEMANTIC_CACHE_ENABLED")) && rdb != nil {
+		semCache, threshold = buildSemanticCache(rdb, logger)
 	}
 
 	handler := server.New(server.Config{
-		GatewayAPIKey:  gatewayKey,
-		Logger:         logger,
-		RequestTimeout: requestTimeout,
-		Breakers:       breakers,
-		Cache:          c,
-		CacheTTL:       cacheTTL,
+		GatewayAPIKey:       gatewayKey,
+		Logger:              logger,
+		RequestTimeout:      requestTimeout,
+		Breakers:            breakers,
+		Cache:               exactCache,
+		CacheTTL:            cacheTTL,
+		SemanticCache:       semCache,
+		SimilarityThreshold: threshold,
 	}, rt)
 
 	addr := os.Getenv("ADDR")
@@ -121,7 +140,8 @@ func main() {
 		"retry_max_attempts", retryCfg.MaxAttempts,
 		"breaker_threshold", breakerCfg.Threshold,
 		"request_timeout", requestTimeout.String(),
-		"cache_enabled", c != nil,
+		"exact_cache", exactCache != nil,
+		"semantic_cache", semCache != nil,
 	)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("server failed", "err", err)
@@ -161,10 +181,11 @@ func configureFailover(rt *router.Router, log *slog.Logger) {
 	}
 }
 
-// buildRedisCache parses REDIS_URL, dials Redis, and returns a Cache.
-// Returns nil (with a warning log) on any failure so the gateway can still
-// serve traffic without caching when Redis is unavailable.
-func buildRedisCache(log *slog.Logger) cache.Cache {
+// buildRedisClient parses REDIS_URL, dials Redis, sanity-pings, and
+// returns the client. Returns nil (with a warning log) on any failure so
+// the gateway can still serve traffic without caching when Redis is
+// unavailable.
+func buildRedisClient(log *slog.Logger) *redis.Client {
 	url := os.Getenv("REDIS_URL")
 	if url == "" {
 		log.Warn("CACHE_ENABLED is set but REDIS_URL is empty; cache disabled")
@@ -186,11 +207,51 @@ func buildRedisCache(log *slog.Logger) cache.Cache {
 		log.Warn("Redis ping failed at startup; cache enabled but degraded",
 			"redis_url", url, "err", err.Error())
 	} else {
-		log.Info("Redis cache connected", "redis_url", url)
+		log.Info("Redis connected", "redis_url", url)
 	}
+	return rdb
+}
+
+// buildSemanticCache wires the embedder + Redis Stack semantic cache and
+// ensures the HNSW index exists. Returns (nil, 0) with a warning if any
+// step fails — the gateway then runs with exact-match-only caching.
+func buildSemanticCache(rdb *redis.Client, log *slog.Logger) (cache.SemanticCache, float64) {
+	embKey := os.Getenv("OPENAI_API_KEY")
+	if embKey == "" {
+		log.Warn("SEMANTIC_CACHE_ENABLED requires OPENAI_API_KEY for embeddings; disabling")
+		return nil, 0
+	}
+	model := os.Getenv("EMBEDDING_MODEL")
+	if model == "" {
+		model = "text-embedding-3-small"
+	}
+	emb := embedder.NewOpenAI(embKey, embedder.WithModel(model, 1536))
 
 	ns := os.Getenv("CACHE_NAMESPACE")
-	return cache.NewRedisCache(rdb, ns)
+	if ns == "" {
+		ns = "llmcache:"
+	}
+	sc := cache.NewRedisSemanticCache(rdb, emb, ns+"semantic:")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := sc.EnsureIndex(ctx); err != nil {
+		log.Warn("FT.CREATE failed (is Redis Stack running with RediSearch?); semantic cache disabled",
+			"err", err.Error())
+		return nil, 0
+	}
+
+	thr := 0.95
+	if v := os.Getenv("SIMILARITY_THRESHOLD"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			thr = f
+		}
+	}
+	log.Info("semantic cache enabled",
+		"embedding_model", model,
+		"similarity_threshold", thr,
+	)
+	return sc, thr
 }
 
 // isTruthy interprets common boolean env strings.
