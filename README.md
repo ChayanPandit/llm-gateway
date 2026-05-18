@@ -32,6 +32,8 @@ provider means writing one adapter; no client code changes.
 - Streaming passthrough as Server-Sent Events
 - **Reliability:** retries with exponential backoff + jitter, per-provider
   circuit breakers, configurable failover chain, per-request timeouts
+- **Caching:** Redis-backed exact-match response cache with TTL, namespacing,
+  `X-Cache` headers, per-request `Cache-Control: no-store` opt-out
 - **Health:** `/healthz` for liveness, `/ready` reflecting breaker state
 - Bearer-token authentication on a single static gateway key
 - Structured JSON logging via `slog`, request IDs propagated through context
@@ -122,6 +124,15 @@ The gateway is configured entirely through environment variables.
 | `FAILOVER_OPENAI`     | (none)  | Fallback model (`<provider>/<model>`) when any `openai/*` request fails  |
 | `FAILOVER_ANTHROPIC`  | (none)  | Fallback model when any `anthropic/*` request fails                |
 
+**Cache (optional, opt-in):**
+
+| Env var            | Default              | Description                                                  |
+|--------------------|----------------------|--------------------------------------------------------------|
+| `CACHE_ENABLED`    | `false`              | Set to `true`/`1`/`yes` to enable the response cache         |
+| `REDIS_URL`        | (none)               | e.g. `redis://localhost:6379`, `rediss://...` for TLS         |
+| `CACHE_TTL`        | `24h`                | How long each cached response lives                          |
+| `CACHE_NAMESPACE`  | `llmcache:`          | Prefix on every Redis key; allows sharing Redis with other apps |
+
 The gateway refuses to start if `GATEWAY_API_KEY` is unset or if no provider
 keys are configured. Misconfigured failover (unknown fallback provider, bad
 syntax) logs a warning and starts with primary-only routing for that prefix.
@@ -143,6 +154,62 @@ Or via Docker Compose (same image as production):
 ```sh
 docker compose -f deploy/docker-compose.yaml --env-file .env up --build
 ```
+
+## Caching
+
+When `CACHE_ENABLED=true` and Redis is reachable, non-streaming
+`/v1/chat/completions` requests are looked up in Redis before reaching the
+upstream provider. A hit returns the cached response in ~5 ms and skips
+both the upstream call (cost) and the failover chain (latency).
+
+### How the cache key is computed
+
+A SHA-256 hex digest of the canonical request fields that determine the
+model's output:
+
+- `model` — fully qualified (`openai/gpt-4o-mini`); different providers'
+  models never collide even with the same short name
+- `messages` — order-significant
+- `temperature`, `top_p`, `max_tokens` — when present
+
+`stream`, request ID, and gateway API key are **not** part of the key.
+
+### Response headers
+
+| Header        | Meaning                                                            |
+|---------------|--------------------------------------------------------------------|
+| `X-Cache: HIT`     | Response served from Redis; no upstream call                  |
+| `X-Cache: MISS`    | Response came from upstream and was just written to the cache |
+| `X-Cache: BYPASS`  | Cache skipped (streaming request, or `Cache-Control: no-store`) |
+| `X-Cache-Key`      | The full cache key, useful for debugging                      |
+
+### What is NOT cached
+
+- **Streaming requests.** Streams pass through to the upstream every time
+  (`X-Cache: BYPASS`). Once an SSE chunk has hit the wire, replaying a
+  cached response would produce a confusing dual response. See the
+  "Why streaming skips caching" design note below.
+- **Requests with `Cache-Control: no-store`.** Per-request opt-out so
+  callers can force a fresh upstream call for one-off needs.
+- **Failed responses.** Only successful 2xx responses get cached.
+
+### What about non-deterministic sampling?
+
+The cache stores responses regardless of `temperature`. If you cached a
+response generated at `temperature=0.9`, subsequent hits return the
+*same* response, not a freshly-sampled one. This matches industry
+convention (LiteLLM, Portkey, Helicone). If true freshness matters for a
+specific request, send `Cache-Control: no-store`.
+
+### When Redis goes down
+
+The gateway **fails open**: cache errors (Redis unreachable, decode
+failure, connection refused) are logged at `WARN` and the request falls
+through to the upstream as if no cache were configured. Caching is an
+optimization, never a correctness primitive — a Redis outage degrades
+performance but never blocks user traffic.
+
+---
 
 ## Usage
 
@@ -218,15 +285,16 @@ Go types.
 ## Project layout
 
 ```
-cmd/gateway/             entrypoint, env config, reliability wiring, graceful shutdown
+cmd/gateway/             entrypoint, env config, reliability + cache wiring
 internal/
   provider/              Provider interface + OpenAI-shaped types + UpstreamError
     openai/              OpenAI adapter (near-passthrough)
     anthropic/           Anthropic adapter (translates to/from Messages API)
   reliability/           hand-rolled retry, circuit breaker, decorator combining both
+  cache/                 Cache interface + canonical key derivation + Redis impl
   router/                "<provider>/<model>" → primary + ordered failover chain
-  server/                chi router, auth + timeout middleware, handler, SSE streaming
-deploy/                  Dockerfile, fly.toml, docker-compose.yaml
+  server/                chi router, auth + timeout middleware, handler, SSE, cache lookup
+deploy/                  Dockerfile, fly.toml, docker-compose.yaml (with redis service)
 ```
 
 ## Tech stack
@@ -288,6 +356,27 @@ broken." Forwarding 4xx upstream status codes verbatim lets clients see
 genuine client errors (`400 invalid model`, `404 model not found`) while
 still mapping 5xx and transport errors to `502 Bad Gateway`.
 
+**Why exact-match caching first, semantic later.** Exact-match is ~10x
+less code than semantic and lets us validate the cache plumbing (Redis
+client, key derivation, headers, fail-open semantics, TTL) without also
+debugging an embedding service and a vector index. Semantic builds on the
+same `Cache` interface in a follow-up — same Redis dep, same handler
+hook, just a different `Get` implementation.
+
+**Why streaming skips caching.** Same reasoning as why streams skip
+retries and failover: once the first SSE chunk has been written, the
+response is committed. Replaying a cached response as synthetic chunks
+is possible but error-prone (timing, finish_reason emission, edge cases
+around tool calls). Production gateways like LiteLLM and Portkey skip
+streams too. Non-streaming workloads are where caching usually matters
+anyway — batch jobs, agent loops, RAG queries.
+
+**Why fail-open on cache errors.** Caching is an optimization, never a
+correctness primitive. A Redis outage shouldn't take down the gateway;
+it should degrade silently to "no cache" mode and let traffic continue.
+The handler logs cache failures at `WARN` so they're visible in
+observability but they never block a request.
+
 ## Testing
 
 ### Unit tests
@@ -303,11 +392,13 @@ Test coverage by package:
 | `internal/provider/openai`           | Headers, body marshaling, response decoding, SSE chunk parsing — using `httptest`   |
 | `internal/provider/anthropic`        | System-message lifting, `max_tokens` default, `stop_reason` mapping, stream folding |
 | `internal/reliability`               | Retry exhaustion + non-retryable short-circuit, jitter ranges, breaker state machine, decorator combines them correctly |
+| `internal/cache`                     | Canonical key derivation (determinism, model/message/temperature changes, order significance), Redis impl round-trip, TTL expiry, namespacing, corrupt-entry handling |
 | `internal/router`                    | Prefix parsing, unknown-provider error, fallback resolution, fallback validation     |
 
-All upstream calls are faked via `httptest.NewServer` and an injectable
-clock for the breaker — no real API keys or sleep waits required to run
-the suite.
+All upstream calls are faked via `httptest.NewServer`, an injectable
+clock for the breaker, and an in-process `miniredis` for the cache —
+no real API keys, no real Redis, no sleep waits required to run the
+suite.
 
 ### Local smoke (requires real provider keys)
 
@@ -353,6 +444,38 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $GATEWAY_API_KEY" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+```
+
+### Cache drills (requires Redis running locally)
+
+```sh
+# Enable the cache: set CACHE_ENABLED=true + REDIS_URL=redis://localhost:6379
+# (docker compose does this for you; for go run, export the vars yourself)
+
+# First request — MISS, hits upstream, gets cached
+curl -i -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+# → X-Cache: MISS, X-Cache-Key: <hash>
+
+# Same request again — HIT, returns from Redis in ~5ms
+curl -i -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+# → X-Cache: HIT, same X-Cache-Key
+
+# Opt out per-request — BYPASS, fresh call every time
+curl -i -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -H "Cache-Control: no-store" \
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+# → X-Cache: BYPASS
+
+# Stream — also BYPASS, streams always pass through
+curl -i -N -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"stream":true}'
+# → X-Cache: BYPASS
 ```
 
 ### Reliability drills (requires real provider keys)

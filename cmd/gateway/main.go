@@ -15,12 +15,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ChayanPandit/llm-gateway/internal/cache"
 	"github.com/ChayanPandit/llm-gateway/internal/provider"
 	"github.com/ChayanPandit/llm-gateway/internal/provider/anthropic"
 	"github.com/ChayanPandit/llm-gateway/internal/provider/openai"
 	"github.com/ChayanPandit/llm-gateway/internal/reliability"
 	"github.com/ChayanPandit/llm-gateway/internal/router"
 	"github.com/ChayanPandit/llm-gateway/internal/server"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -71,11 +73,23 @@ func main() {
 	rt := router.New(providers)
 	configureFailover(rt, logger)
 
+	// Cache is optional. If CACHE_ENABLED=true (and REDIS_URL is set), we
+	// connect; otherwise the handler runs without caching. Connect failures
+	// don't fatal the gateway — log a warning and proceed cache-less so a
+	// flaky Redis can't prevent a fresh deploy from coming up.
+	var c cache.Cache
+	cacheTTL := getEnvDuration("CACHE_TTL", 24*time.Hour)
+	if isTruthy(os.Getenv("CACHE_ENABLED")) {
+		c = buildRedisCache(logger)
+	}
+
 	handler := server.New(server.Config{
 		GatewayAPIKey:  gatewayKey,
 		Logger:         logger,
 		RequestTimeout: requestTimeout,
 		Breakers:       breakers,
+		Cache:          c,
+		CacheTTL:       cacheTTL,
 	}, rt)
 
 	addr := os.Getenv("ADDR")
@@ -107,6 +121,7 @@ func main() {
 		"retry_max_attempts", retryCfg.MaxAttempts,
 		"breaker_threshold", breakerCfg.Threshold,
 		"request_timeout", requestTimeout.String(),
+		"cache_enabled", c != nil,
 	)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("server failed", "err", err)
@@ -144,6 +159,47 @@ func configureFailover(rt *router.Router, log *slog.Logger) {
 		}
 		log.Info("failover configured", "primary", primary, "fallback", fallback)
 	}
+}
+
+// buildRedisCache parses REDIS_URL, dials Redis, and returns a Cache.
+// Returns nil (with a warning log) on any failure so the gateway can still
+// serve traffic without caching when Redis is unavailable.
+func buildRedisCache(log *slog.Logger) cache.Cache {
+	url := os.Getenv("REDIS_URL")
+	if url == "" {
+		log.Warn("CACHE_ENABLED is set but REDIS_URL is empty; cache disabled")
+		return nil
+	}
+	opts, err := redis.ParseURL(url)
+	if err != nil {
+		log.Warn("invalid REDIS_URL; cache disabled", "err", err.Error())
+		return nil
+	}
+	rdb := redis.NewClient(opts)
+
+	// Sanity ping with a short deadline so we don't block startup on a
+	// wedged Redis. A failure is not fatal — the handler fail-opens on
+	// runtime Redis errors anyway.
+	pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := rdb.Ping(pingCtx).Err(); err != nil {
+		log.Warn("Redis ping failed at startup; cache enabled but degraded",
+			"redis_url", url, "err", err.Error())
+	} else {
+		log.Info("Redis cache connected", "redis_url", url)
+	}
+
+	ns := os.Getenv("CACHE_NAMESPACE")
+	return cache.NewRedisCache(rdb, ns)
+}
+
+// isTruthy interprets common boolean env strings.
+func isTruthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "t", "yes", "y", "on":
+		return true
+	}
+	return false
 }
 
 func getEnvInt(key string, def int) int {

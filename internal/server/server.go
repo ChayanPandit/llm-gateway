@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/ChayanPandit/llm-gateway/internal/cache"
 	"github.com/ChayanPandit/llm-gateway/internal/provider"
 	"github.com/ChayanPandit/llm-gateway/internal/reliability"
 	"github.com/ChayanPandit/llm-gateway/internal/router"
@@ -21,8 +23,10 @@ import (
 type Config struct {
 	GatewayAPIKey  string
 	Logger         *slog.Logger
-	RequestTimeout time.Duration       // applied to /v1/* requests
+	RequestTimeout time.Duration          // applied to /v1/* requests
 	Breakers       []*reliability.Breaker // for /ready to inspect
+	Cache          cache.Cache            // optional; nil disables caching
+	CacheTTL       time.Duration          // ignored if Cache is nil
 }
 
 func New(cfg Config, r *router.Router) http.Handler {
@@ -48,7 +52,7 @@ func New(cfg Config, r *router.Router) http.Handler {
 	mux.Group(func(g chi.Router) {
 		g.Use(authMiddleware(cfg.GatewayAPIKey))
 		g.Use(timeoutMiddleware(cfg.RequestTimeout))
-		g.Post("/v1/chat/completions", chatCompletionsHandler(r, cfg.Logger))
+		g.Post("/v1/chat/completions", chatCompletionsHandler(r, cfg.Cache, cfg.CacheTTL, cfg.Logger))
 	})
 
 	return mux
@@ -125,7 +129,7 @@ func requestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 	}
 }
 
-func chatCompletionsHandler(rt *router.Router, log *slog.Logger) http.HandlerFunc {
+func chatCompletionsHandler(rt *router.Router, c cache.Cache, ttl time.Duration, log *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req provider.Request
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -145,11 +149,36 @@ func chatCompletionsHandler(rt *router.Router, log *slog.Logger) http.HandlerFun
 
 		ctx := r.Context()
 		if req.Stream {
-			// Stream uses primary only; no failover for streams (see decorator.go).
+			// Streams bypass the cache — see internal/cache/cache.go.
+			w.Header().Set("X-Cache", "BYPASS")
 			streamReq := req
 			streamReq.Model = chain.Primary.Model
 			streamResponse(ctx, w, chain.Primary.Provider, &streamReq, log)
 			return
+		}
+
+		// Determine cache eligibility:
+		// - Cache must be configured
+		// - Request must not opt out via Cache-Control: no-store
+		cacheEligible := c != nil && !cacheOptOut(r)
+
+		// Compute key only if eligible — the hash is cheap but pointless if not.
+		var cacheKey string
+		if cacheEligible {
+			cacheKey = cache.Key(&req)
+			if resp, hit, err := c.Get(ctx, cacheKey); err != nil {
+				// Fail-open: log and continue to upstream.
+				log.Warn("cache get failed; serving from upstream",
+					"err", err.Error(),
+					"request_id", middleware.GetReqID(ctx),
+				)
+			} else if hit {
+				w.Header().Set("X-Cache", "HIT")
+				w.Header().Set("X-Cache-Key", cacheKey)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(resp)
+				return
+			}
 		}
 
 		resp, lastErr := tryChain(ctx, chain, &req, log)
@@ -157,9 +186,40 @@ func chatCompletionsHandler(rt *router.Router, log *slog.Logger) http.HandlerFun
 			handleUpstreamError(w, lastErr)
 			return
 		}
+
+		// Write to cache on success. Failures are non-fatal.
+		if cacheEligible && cacheKey != "" {
+			if err := c.Put(ctx, cacheKey, resp, ttl); err != nil {
+				log.Warn("cache put failed; response still served",
+					"err", err.Error(),
+					"request_id", middleware.GetReqID(ctx),
+				)
+			}
+			w.Header().Set("X-Cache", "MISS")
+			w.Header().Set("X-Cache-Key", cacheKey)
+		} else if c == nil {
+			// Cache not configured; don't advertise the header at all.
+		} else {
+			w.Header().Set("X-Cache", "BYPASS")
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	}
+}
+
+// cacheOptOut reports whether the request asks the gateway to skip the
+// cache layer via the standard Cache-Control directive.
+func cacheOptOut(r *http.Request) bool {
+	cc := r.Header.Get("Cache-Control")
+	if cc == "" {
+		return false
+	}
+	for _, tok := range strings.Split(cc, ",") {
+		if strings.EqualFold(strings.TrimSpace(tok), "no-store") {
+			return true
+		}
+	}
+	return false
 }
 
 // tryChain attempts the primary target, then walks fallbacks on failover-
