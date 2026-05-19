@@ -1,6 +1,9 @@
 services:
+  # Redis Stack ships RediSearch (with vector indexing) + plain Redis in one
+  # image. Backwards-compatible with the plain redis:7-alpine the exact-match
+  # cache was built against — same port, same protocol, just adds FT.* commands.
   redis:
-    image: redis:7-alpine
+    image: redis/redis-stack-server:latest
     ports:
       - "6379:6379"
     healthcheck:

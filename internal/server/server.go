@@ -21,12 +21,14 @@ import (
 )
 
 type Config struct {
-	GatewayAPIKey  string
-	Logger         *slog.Logger
-	RequestTimeout time.Duration          // applied to /v1/* requests
-	Breakers       []*reliability.Breaker // for /ready to inspect
-	Cache          cache.Cache            // optional; nil disables caching
-	CacheTTL       time.Duration          // ignored if Cache is nil
+	GatewayAPIKey       string
+	Logger              *slog.Logger
+	RequestTimeout      time.Duration          // applied to /v1/* requests
+	Breakers            []*reliability.Breaker // for /ready to inspect
+	Cache               cache.Cache            // optional; nil disables exact-match caching
+	CacheTTL            time.Duration          // ignored if Cache is nil
+	SemanticCache       cache.SemanticCache    // optional; nil disables semantic
+	SimilarityThreshold float64                // ignored if SemanticCache is nil
 }
 
 func New(cfg Config, r *router.Router) http.Handler {
@@ -52,7 +54,7 @@ func New(cfg Config, r *router.Router) http.Handler {
 	mux.Group(func(g chi.Router) {
 		g.Use(authMiddleware(cfg.GatewayAPIKey))
 		g.Use(timeoutMiddleware(cfg.RequestTimeout))
-		g.Post("/v1/chat/completions", chatCompletionsHandler(r, cfg.Cache, cfg.CacheTTL, cfg.Logger))
+		g.Post("/v1/chat/completions", chatCompletionsHandler(r, cfg.Cache, cfg.CacheTTL, cfg.SemanticCache, cfg.SimilarityThreshold, cfg.Logger))
 	})
 
 	return mux
@@ -129,7 +131,14 @@ func requestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 	}
 }
 
-func chatCompletionsHandler(rt *router.Router, c cache.Cache, ttl time.Duration, log *slog.Logger) http.HandlerFunc {
+func chatCompletionsHandler(
+	rt *router.Router,
+	c cache.Cache,
+	ttl time.Duration,
+	sc cache.SemanticCache,
+	threshold float64,
+	log *slog.Logger,
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req provider.Request
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -160,15 +169,14 @@ func chatCompletionsHandler(rt *router.Router, c cache.Cache, ttl time.Duration,
 		// Determine cache eligibility:
 		// - Cache must be configured
 		// - Request must not opt out via Cache-Control: no-store
-		cacheEligible := c != nil && !cacheOptOut(r)
+		cacheEligible := (c != nil || sc != nil) && !cacheOptOut(r)
 
-		// Compute key only if eligible — the hash is cheap but pointless if not.
+		// Tier 1: exact-match cache lookup.
 		var cacheKey string
-		if cacheEligible {
+		if cacheEligible && c != nil {
 			cacheKey = cache.Key(&req)
 			if resp, hit, err := c.Get(ctx, cacheKey); err != nil {
-				// Fail-open: log and continue to upstream.
-				log.Warn("cache get failed; serving from upstream",
+				log.Warn("cache get failed; falling through",
 					"err", err.Error(),
 					"request_id", middleware.GetReqID(ctx),
 				)
@@ -181,25 +189,57 @@ func chatCompletionsHandler(rt *router.Router, c cache.Cache, ttl time.Duration,
 			}
 		}
 
+		// Tier 2: semantic-match cache lookup on exact miss.
+		if cacheEligible && sc != nil {
+			if resp, hit, sim, err := sc.LookupSimilar(ctx, &req, threshold); err != nil {
+				log.Warn("semantic cache lookup failed; falling through",
+					"err", err.Error(),
+					"request_id", middleware.GetReqID(ctx),
+				)
+			} else if hit {
+				w.Header().Set("X-Cache", "SEMANTIC-HIT")
+				w.Header().Set("X-Cache-Similarity", fmt.Sprintf("%.4f", sim))
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(resp)
+				return
+			} else if sim > 0 {
+				// Useful for tuning — log the best candidate even on a miss.
+				log.Debug("semantic miss",
+					"best_similarity", sim,
+					"threshold", threshold,
+					"request_id", middleware.GetReqID(ctx),
+				)
+			}
+		}
+
+		// Tier 3: upstream call via failover chain.
 		resp, lastErr := tryChain(ctx, chain, &req, log)
 		if lastErr != nil {
 			handleUpstreamError(w, lastErr)
 			return
 		}
 
-		// Write to cache on success. Failures are non-fatal.
-		if cacheEligible && cacheKey != "" {
-			if err := c.Put(ctx, cacheKey, resp, ttl); err != nil {
-				log.Warn("cache put failed; response still served",
-					"err", err.Error(),
-					"request_id", middleware.GetReqID(ctx),
-				)
+		// Populate BOTH caches on success. Failures are non-fatal.
+		if cacheEligible {
+			if c != nil && cacheKey != "" {
+				if err := c.Put(ctx, cacheKey, resp, ttl); err != nil {
+					log.Warn("cache put failed",
+						"err", err.Error(),
+						"request_id", middleware.GetReqID(ctx),
+					)
+				}
+				w.Header().Set("X-Cache-Key", cacheKey)
+			}
+			if sc != nil {
+				if err := sc.Index(ctx, &req, resp, ttl); err != nil {
+					log.Warn("semantic cache index failed",
+						"err", err.Error(),
+						"request_id", middleware.GetReqID(ctx),
+					)
+				}
 			}
 			w.Header().Set("X-Cache", "MISS")
-			w.Header().Set("X-Cache-Key", cacheKey)
-		} else if c == nil {
-			// Cache not configured; don't advertise the header at all.
-		} else {
+		} else if c != nil || sc != nil {
 			w.Header().Set("X-Cache", "BYPASS")
 		}
 		w.Header().Set("Content-Type", "application/json")

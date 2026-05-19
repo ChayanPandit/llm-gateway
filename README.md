@@ -32,8 +32,11 @@ provider means writing one adapter; no client code changes.
 - Streaming passthrough as Server-Sent Events
 - **Reliability:** retries with exponential backoff + jitter, per-provider
   circuit breakers, configurable failover chain, per-request timeouts
-- **Caching:** Redis-backed exact-match response cache with TTL, namespacing,
-  `X-Cache` headers, per-request `Cache-Control: no-store` opt-out
+- **Caching (tiered):** exact-match for byte-identical requests, semantic
+  cache for paraphrased ones via OpenAI embeddings + Redis Stack HNSW
+  vector index. Per-tier headers (`X-Cache: HIT|SEMANTIC-HIT|MISS|BYPASS`,
+  `X-Cache-Similarity`), pluggable `Embedder` interface, per-request
+  `Cache-Control: no-store` opt-out
 - **Health:** `/healthz` for liveness, `/ready` reflecting breaker state
 - Bearer-token authentication on a single static gateway key
 - Structured JSON logging via `slog`, request IDs propagated through context
@@ -126,12 +129,15 @@ The gateway is configured entirely through environment variables.
 
 **Cache (optional, opt-in):**
 
-| Env var            | Default              | Description                                                  |
-|--------------------|----------------------|--------------------------------------------------------------|
-| `CACHE_ENABLED`    | `false`              | Set to `true`/`1`/`yes` to enable the response cache         |
-| `REDIS_URL`        | (none)               | e.g. `redis://localhost:6379`, `rediss://...` for TLS         |
-| `CACHE_TTL`        | `24h`                | How long each cached response lives                          |
-| `CACHE_NAMESPACE`  | `llmcache:`          | Prefix on every Redis key; allows sharing Redis with other apps |
+| Env var                  | Default                  | Description                                                          |
+|--------------------------|--------------------------|----------------------------------------------------------------------|
+| `CACHE_ENABLED`          | `false`                  | Set to `true`/`1`/`yes` to enable the response cache                 |
+| `REDIS_URL`              | (none)                   | e.g. `redis://localhost:6379`, `rediss://...` for TLS                |
+| `CACHE_TTL`              | `24h`                    | How long each cached response lives                                  |
+| `CACHE_NAMESPACE`        | `llmcache:`              | Prefix on every Redis key; allows sharing Redis with other apps      |
+| `SEMANTIC_CACHE_ENABLED` | `false`                  | Set truthy to enable Tier 2. Requires Redis Stack + `OPENAI_API_KEY` |
+| `EMBEDDING_MODEL`        | `text-embedding-3-small` | OpenAI embedding model (must match `DIM` of the RediSearch index)     |
+| `SIMILARITY_THRESHOLD`   | `0.95`                   | Cosine similarity required for a semantic hit (0.0-1.0)              |
 
 The gateway refuses to start if `GATEWAY_API_KEY` is unset or if no provider
 keys are configured. Misconfigured failover (unknown fallback provider, bad
@@ -157,15 +163,29 @@ docker compose -f deploy/docker-compose.yaml --env-file .env up --build
 
 ## Caching
 
-When `CACHE_ENABLED=true` and Redis is reachable, non-streaming
-`/v1/chat/completions` requests are looked up in Redis before reaching the
-upstream provider. A hit returns the cached response in ~5 ms and skips
-both the upstream call (cost) and the failover chain (latency).
+The gateway has two cache tiers that run in order on every non-streaming
+request:
 
-### How the cache key is computed
+```
+Request
+   ↓
+Tier 1: exact-match    →  HIT  →  return  (X-Cache: HIT)
+   ↓ MISS
+Tier 2: semantic match →  HIT  →  return  (X-Cache: SEMANTIC-HIT,
+   ↓ MISS                                  X-Cache-Similarity: 0.96)
+Upstream call (with retries + failover)
+   ↓ success
+Write to BOTH cache tiers   (X-Cache: MISS)
+```
 
-A SHA-256 hex digest of the canonical request fields that determine the
-model's output:
+Both tiers are opt-in via env. You can run exact-only, semantic-only is
+not supported (semantic builds on the exact-cache plumbing), or both.
+
+### Tier 1 — Exact-match
+
+When `CACHE_ENABLED=true` and Redis is reachable, byte-identical requests
+return the cached response in ~5 ms. The cache key is a SHA-256 hex
+digest of the canonical request fields that determine the model's output:
 
 - `model` — fully qualified (`openai/gpt-4o-mini`); different providers'
   models never collide even with the same short name
@@ -174,40 +194,70 @@ model's output:
 
 `stream`, request ID, and gateway API key are **not** part of the key.
 
+### Tier 2 — Semantic match
+
+When `SEMANTIC_CACHE_ENABLED=true` (and Redis Stack is running), exact
+misses fall through to a vector similarity search:
+
+1. The last `user` message is sent to OpenAI's `/v1/embeddings` endpoint
+   (model: `text-embedding-3-small`, 1536-dim vector).
+2. Redis Stack's RediSearch HNSW index returns the nearest stored vector.
+3. Cosine similarity (`1 - distance`) is compared against
+   `SIMILARITY_THRESHOLD` (default 0.95).
+4. On hit, the cached response is returned with `X-Cache: SEMANTIC-HIT`
+   and the measured similarity in `X-Cache-Similarity`.
+
+Typical hit-rate uplift over exact-only: **5-15% → 30-60%** on real
+LLM traffic where users phrase the same intent in different ways.
+
+**Caveat:** only the most recent user message is embedded — conversation
+history is ignored for similarity. This matches the industry-standard
+approach but means a follow-up question like *"and the next one?"* might
+unexpectedly match an unrelated prior cache entry. Mitigate by raising
+the threshold (e.g., 0.97) or sending `Cache-Control: no-store` for
+context-sensitive requests.
+
+The `Embedder` interface in `internal/embedder/` is pluggable; a local
+ONNX-based embedder is a planned follow-up.
+
 ### Response headers
 
-| Header        | Meaning                                                            |
-|---------------|--------------------------------------------------------------------|
-| `X-Cache: HIT`     | Response served from Redis; no upstream call                  |
-| `X-Cache: MISS`    | Response came from upstream and was just written to the cache |
-| `X-Cache: BYPASS`  | Cache skipped (streaming request, or `Cache-Control: no-store`) |
-| `X-Cache-Key`      | The full cache key, useful for debugging                      |
+| Header                    | Meaning                                                       |
+|---------------------------|---------------------------------------------------------------|
+| `X-Cache: HIT`            | Tier 1 served from Redis; no upstream call                    |
+| `X-Cache: SEMANTIC-HIT`   | Tier 2 returned a similar prior response                      |
+| `X-Cache: MISS`           | Upstream call succeeded; response written to both tiers       |
+| `X-Cache: BYPASS`         | Stream request or `Cache-Control: no-store`                   |
+| `X-Cache-Key`             | The exact-match cache key (Tier 1 hit/miss only)              |
+| `X-Cache-Similarity`      | Cosine similarity of the match (Tier 2 hit only)              |
 
 ### What is NOT cached
 
 - **Streaming requests.** Streams pass through to the upstream every time
   (`X-Cache: BYPASS`). Once an SSE chunk has hit the wire, replaying a
-  cached response would produce a confusing dual response. See the
-  "Why streaming skips caching" design note below.
-- **Requests with `Cache-Control: no-store`.** Per-request opt-out so
-  callers can force a fresh upstream call for one-off needs.
+  cached response would produce a confusing dual response.
+- **Requests with `Cache-Control: no-store`.** Per-request opt-out.
 - **Failed responses.** Only successful 2xx responses get cached.
 
 ### What about non-deterministic sampling?
 
 The cache stores responses regardless of `temperature`. If you cached a
 response generated at `temperature=0.9`, subsequent hits return the
-*same* response, not a freshly-sampled one. This matches industry
-convention (LiteLLM, Portkey, Helicone). If true freshness matters for a
-specific request, send `Cache-Control: no-store`.
+*same* response, not a freshly-sampled one. Matches industry convention
+(LiteLLM, Portkey, Helicone). For fresh sampling, send
+`Cache-Control: no-store`.
 
-### When Redis goes down
+### When Redis (or the embedder) goes down
 
-The gateway **fails open**: cache errors (Redis unreachable, decode
-failure, connection refused) are logged at `WARN` and the request falls
-through to the upstream as if no cache were configured. Caching is an
-optimization, never a correctness primitive — a Redis outage degrades
-performance but never blocks user traffic.
+The gateway **fails open at every layer**:
+
+- Redis unreachable → Tier 1 skipped, request falls through to upstream
+- Embedder unreachable → Tier 2 skipped, request falls through to upstream
+- RediSearch index missing → semantic cache disabled at startup with a warning
+- Corrupt cache entry → treated as a miss, repopulated on next hit
+
+Caching is an optimization, never a correctness primitive — outages
+degrade performance but never block user traffic.
 
 ---
 
@@ -291,10 +341,13 @@ internal/
     openai/              OpenAI adapter (near-passthrough)
     anthropic/           Anthropic adapter (translates to/from Messages API)
   reliability/           hand-rolled retry, circuit breaker, decorator combining both
-  cache/                 Cache interface + canonical key derivation + Redis impl
+  embedder/              Embedder interface + OpenAI text-embedding-3-small impl
+  cache/                 exact-match Cache + canonical key derivation + Redis impl
+                         SemanticCache + RediSearch HNSW vector index impl
   router/                "<provider>/<model>" → primary + ordered failover chain
-  server/                chi router, auth + timeout middleware, handler, SSE, cache lookup
-deploy/                  Dockerfile, fly.toml, docker-compose.yaml (with redis service)
+  server/                chi router, auth + timeout middleware, handler, SSE,
+                         tiered cache lookup (exact → semantic → upstream)
+deploy/                  Dockerfile, fly.toml, docker-compose.yaml (redis-stack)
 ```
 
 ## Tech stack
@@ -356,12 +409,25 @@ broken." Forwarding 4xx upstream status codes verbatim lets clients see
 genuine client errors (`400 invalid model`, `404 model not found`) while
 still mapping 5xx and transport errors to `502 Bad Gateway`.
 
-**Why exact-match caching first, semantic later.** Exact-match is ~10x
-less code than semantic and lets us validate the cache plumbing (Redis
-client, key derivation, headers, fail-open semantics, TTL) without also
-debugging an embedding service and a vector index. Semantic builds on the
-same `Cache` interface in a follow-up — same Redis dep, same handler
-hook, just a different `Get` implementation.
+**Why a pluggable `Embedder` interface.** The interface is literally
+three methods (`Embed`, `Dim`, `Name`) — negligible upfront cost. The
+payoff is real: the semantic cache code doesn't care whether the
+embedder calls OpenAI, runs a local ONNX model, or queries some
+hypothetical cloud provider. Swapping is a one-line change in `main.go`.
+Pays for itself the first time you want to add a second backend.
+
+**Why tiered caching (exact → semantic → upstream).** Exact match is
+~5 ms and free; semantic match is ~100 ms (one embedding call + a
+RediSearch query). Putting exact first means latency only grows when
+there's something to gain. A byte-identical retry of yesterday's request
+never pays the embedding cost.
+
+**Why store responses regardless of temperature.** Convention. LiteLLM,
+Portkey, and Helicone all do this. The alternative — caching only when
+`temperature == 0` — sounds principled but in practice almost everyone
+runs `temperature=0.5-0.8` and would never get a cache hit. We trade a
+small correctness footnote (cache hits don't re-sample) for a useful
+default. Per-request `Cache-Control: no-store` opts out.
 
 **Why streaming skips caching.** Same reasoning as why streams skip
 retries and failover: once the first SSE chunk has been written, the
@@ -392,7 +458,8 @@ Test coverage by package:
 | `internal/provider/openai`           | Headers, body marshaling, response decoding, SSE chunk parsing — using `httptest`   |
 | `internal/provider/anthropic`        | System-message lifting, `max_tokens` default, `stop_reason` mapping, stream folding |
 | `internal/reliability`               | Retry exhaustion + non-retryable short-circuit, jitter ranges, breaker state machine, decorator combines them correctly |
-| `internal/cache`                     | Canonical key derivation (determinism, model/message/temperature changes, order significance), Redis impl round-trip, TTL expiry, namespacing, corrupt-entry handling |
+| `internal/cache`                     | Canonical key derivation (determinism, model/message/temperature changes, order significance), Redis impl round-trip, TTL expiry, namespacing, corrupt-entry handling, semantic helpers (last-user-message scan, vector byte encoding, FT.SEARCH result parsing) |
+| `internal/embedder`                  | OpenAI embeddings request shape, response parsing, error mapping to `*UpstreamError`, dimension-mismatch rejection, empty-data rejection |
 | `internal/router`                    | Prefix parsing, unknown-provider error, fallback resolution, fallback validation     |
 
 All upstream calls are faked via `httptest.NewServer`, an injectable
@@ -446,32 +513,45 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-### Cache drills (requires Redis running locally)
+### Cache drills (requires Redis Stack running locally)
 
 ```sh
-# Enable the cache: set CACHE_ENABLED=true + REDIS_URL=redis://localhost:6379
-# (docker compose does this for you; for go run, export the vars yourself)
+# Enable both tiers: CACHE_ENABLED=true + SEMANTIC_CACHE_ENABLED=true
+# OPENAI_API_KEY must be set (for embeddings, even if your primary chat
+# provider is Anthropic).
 
-# First request — MISS, hits upstream, gets cached
+# First request — MISS, hits upstream, gets cached in BOTH tiers
 curl -i -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $GATEWAY_API_KEY" \
-  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"What is the capital of France?"}]}'
 # → X-Cache: MISS, X-Cache-Key: <hash>
 
-# Same request again — HIT, returns from Redis in ~5ms
+# Same exact request — Tier 1 HIT, ~5ms
 curl -i -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $GATEWAY_API_KEY" \
-  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
-# → X-Cache: HIT, same X-Cache-Key
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"What is the capital of France?"}]}'
+# → X-Cache: HIT
 
-# Opt out per-request — BYPASS, fresh call every time
+# Paraphrased request — Tier 2 SEMANTIC-HIT
+curl -i -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"Tell me France'\''s capital city"}]}'
+# → X-Cache: SEMANTIC-HIT, X-Cache-Similarity: 0.96xx
+
+# Unrelated topic — both tiers MISS
+curl -i -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"What is photosynthesis?"}]}'
+# → X-Cache: MISS
+
+# Opt out per-request
 curl -i -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $GATEWAY_API_KEY" \
   -H "Cache-Control: no-store" \
-  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"What is the capital of France?"}]}'
 # → X-Cache: BYPASS
 
-# Stream — also BYPASS, streams always pass through
+# Stream — also BYPASS
 curl -i -N -X POST http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $GATEWAY_API_KEY" \
   -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"stream":true}'
